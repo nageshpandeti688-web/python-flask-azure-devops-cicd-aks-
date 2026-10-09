@@ -1,0 +1,10 @@
+
+az acr create --resource-group rg-aks-devops-demo --name acrdevopsdemo123 --sku Basic
+
+az aks create --resource-group rg-aks-devops-demo --name aks-devops-demo --location centralindia --node-count 1 --node-vm-size Standard_D2s_v5 --generate-ssh-keys 
+
+az aks update --resource-group rg-aks-devops-demo --name aks-devops-demo --attach-acr acrdevopsdemo123
+
+az aks get-credentials --resource-group rg-aks-devops-demo --name aks-devops-demo --overwrite-existing
+
+az group delete --name rg-aks-devops-demo --yes --no-wait
