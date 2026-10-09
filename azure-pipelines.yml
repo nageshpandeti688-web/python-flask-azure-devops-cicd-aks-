@@ -1,0 +1,163 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  pythonVersion: '3.12'
+  imageRepository: 'flask-demo'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  tag: '$(Build.BuildId)'
+  kubernetesNamespace: 'default'
+
+stages:
+
+  # Stage 1: Python tests and SonarCloud analysis
+  - stage: TestAndScan
+    displayName: Test and SonarCloud Scan
+    jobs:
+      - job: Test
+        displayName: Test Python Application
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pytest -v
+            displayName: Install dependencies and run tests
+
+          - task: SonarCloudPrepare@4
+            displayName: Prepare SonarCloud
+            inputs:
+              SonarCloud: 'SonarQube-Connection'
+              organization: 'nageshpandeti34'
+              scannerMode: 'cli'
+              configMode: 'manual'
+              cliProjectKey: 'nageshpandeti34_Fxlm'
+              cliProjectName: 'Fxlm'
+              cliSources: '.'
+              extraProperties: |
+                sonar.exclusions=**/test_*.py,**/.venv/**,**/__pycache__/**
+
+          - task: SonarCloudAnalyze@4
+            displayName: Run SonarCloud Analysis
+
+          - task: SonarCloudPublish@4
+            displayName: Publish Quality Gate
+            inputs:
+              pollingTimeoutSec: '300'
+
+  # Stage 2: Build Docker image and push to ACR
+  - stage: BuildAndPush
+    displayName: Build and Push Docker Image
+    dependsOn: TestAndScan
+    condition: succeeded()
+    jobs:
+      - job: Docker
+        displayName: Build and Push Image
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Build and push image to ACR
+            inputs:
+              azureSubscription: 'Azure-Connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+                IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+                az acr login --name "$ACR_NAME"
+
+                docker build \
+                  -f "$(Build.SourcesDirectory)/Dockerfile" \
+                  -t "$IMAGE" \
+                  "$(Build.SourcesDirectory)"
+
+                docker push "$IMAGE"
+
+                echo "Successfully pushed: $IMAGE"
+            env:
+              ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+              IMAGE_REPOSITORY: $(imageRepository)
+              IMAGE_TAG: $(tag)
+
+  # Stage 3: Deploy to AKS
+  - stage: Deploy
+    displayName: Deploy to AKS
+    dependsOn: BuildAndPush
+    condition: succeeded()
+    jobs:
+      - job: DeployAKS
+        displayName: Deploy Flask Application
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Deploy application to AKS
+            inputs:
+              azureSubscription: 'Azure-Connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                echo "Getting AKS credentials..."
+
+                az aks get-credentials \
+                  --resource-group "$AKS_RESOURCE_GROUP" \
+                  --name "$AKS_CLUSTER_NAME" \
+                  --overwrite-existing
+
+                echo "Creating Kubernetes namespace..."
+
+                kubectl create namespace "$K8S_NAMESPACE" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+
+                echo "Applying Kubernetes service..."
+
+                kubectl apply \
+                  -n "$K8S_NAMESPACE" \
+                  -f k8s/service.yaml
+
+                echo "Deploying application image..."
+
+                sed "s|IMAGE_PLACEHOLDER|${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}|g" \
+                  k8s/deployment.yaml | kubectl apply \
+                  -n "$K8S_NAMESPACE" -f -
+
+                echo "Waiting for deployment rollout..."
+
+                kubectl rollout status deployment/flask-demo \
+                  -n "$K8S_NAMESPACE" \
+                  --timeout=180s
+
+                echo "Checking pods..."
+
+                kubectl get pods -n "$K8S_NAMESPACE"
+
+                echo "Checking service..."
+
+                kubectl get service flask-demo-service \
+                  -n "$K8S_NAMESPACE"
+
+                echo "Deployment completed."
+            env:
+              AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)
+              AKS_CLUSTER_NAME: $(AKS_CLUSTER_NAME)
+              K8S_NAMESPACE: $(kubernetesNamespace)
+              ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+              IMAGE_REPOSITORY: $(imageRepository)
+              IMAGE_TAG: $(tag)
